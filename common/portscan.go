@@ -53,23 +53,67 @@ func ParsePort(ports string) (scanPorts []int) {
 	return scanPorts
 }
 
-func PortScanTCP(IPs []string, Ports string, timeout int) []string {
+var BackList map[string]struct{}
+var BackListLock sync.Mutex
+
+func PortScanTCP(IPs []string, Ports string, NoPorts string, timeout int) []string {
 	var AliveAddress []string
 	gologger.AuditTimeLogger("开始TCP端口扫描，端口设置: %s\nTCP端口扫描目标:%s", Ports, strings.Join(IPs, ","))
-	probePorts := ParsePort(Ports)
+	ports := ParsePort(Ports)
+	noPorts := ParsePort(NoPorts)
+
+	var probePorts []int
+	for _, port := range ports {
+		ok := false
+		for _, nport := range noPorts {
+			if nport == port {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			probePorts = append(probePorts, port)
+		}
+	}
+
+	IPPortCount := make(map[string]int)
+	BackList = make(map[string]struct{})
 
 	workers := structs.GlobalConfig.TCPPortScanThreads
 	if workers > len(IPs)*len(probePorts) {
 		workers = len(IPs) * len(probePorts)
 	}
-	Addrs := make(chan Addr, len(IPs)*len(probePorts))
-	results := make(chan string, len(IPs)*len(probePorts))
+	Addrs := make(chan Addr, structs.GlobalConfig.TCPPortScanThreads)
+	results := make(chan string, structs.GlobalConfig.TCPPortScanThreads)
 	var wg sync.WaitGroup
 
 	//接收结果
 	go func() {
 		for found := range results {
 			AliveAddress = append(AliveAddress, found)
+
+			t := strings.Split(found, ":")
+			ip := t[0]
+
+			count, ok := IPPortCount[ip]
+			if ok {
+				if count > structs.GlobalConfig.PortsThreshold {
+					inblack := false
+					BackListLock.Lock()
+					_, inblack = BackList[ip]
+					BackListLock.Unlock()
+					if !inblack {
+						BackListLock.Lock()
+						BackList[ip] = struct{}{}
+						BackListLock.Unlock()
+						gologger.Error().Msgf("%s 端口数量超出阈值,放弃扫描", ip)
+					}
+				}
+				IPPortCount[ip] = count + 1
+			} else {
+				IPPortCount[ip] = 1
+			}
+
 			wg.Done()
 		}
 	}()
@@ -107,6 +151,14 @@ type Addr struct {
 var PortScan bool
 
 func PortConnect(addr Addr, respondingHosts chan<- string, adjustedTimeout int, wg *sync.WaitGroup) {
+	inblack := false
+	BackListLock.Lock()
+	_, inblack = BackList[addr.ip]
+	BackListLock.Unlock()
+	if inblack {
+		return
+	}
+
 	host, port := addr.ip, addr.port
 	conn, err := WrapperTcpWithTimeout("tcp4", fmt.Sprintf("%s:%v", host, port), time.Duration(adjustedTimeout)*time.Second)
 	defer func() {
